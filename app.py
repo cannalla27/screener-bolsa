@@ -310,14 +310,11 @@ def construir_payload(filtros, tf, orden_campo, orden_dir, limite, excluidos=(),
     campos = [c for c in CAMPOS_API if c not in excluidos]
     flt = []
     for izq, op, der in filtros:
-        if izq in excluidos or (isinstance(der, str) and der in excluidos):
-            continue
         flt.append({"left": con_tf(izq, tf), "operation": op,
                     "right": con_tf(der, tf) if isinstance(der, str) and der in CAMPOS else der})
     if primarios:
         flt.append({"left": "type", "operation": "in_range", "right": ["stock", "dr"]})
-        if "is_primary" not in excluidos:
-            flt.append({"left": "is_primary", "operation": "equal", "right": True})
+        flt.append({"left": "is_primary", "operation": "equal", "right": True})
     payload = {
         "columns": [con_tf(c, tf) for c in campos],
         "filter": flt,
@@ -325,7 +322,7 @@ def construir_payload(filtros, tf, orden_campo, orden_dir, limite, excluidos=(),
         "range": [0, int(limite)],
         "ignore_unknown_fields": False,
     }
-    if orden_campo and orden_campo not in excluidos:
+    if orden_campo:
         payload["sort"] = {"sortBy": con_tf(orden_campo, tf), "sortOrder": orden_dir}
     if symbolset:
         payload["symbols"] = {"symbolset": [symbolset]}
@@ -334,7 +331,7 @@ def construir_payload(filtros, tf, orden_campo, orden_dir, limite, excluidos=(),
 
 @st.cache_data(ttl=5, show_spinner=False)
 def escanear(url, payload_json, sessionid):
-    """Llama al escáner. Si un campo ya no existe en la API lo descarta y reintenta."""
+    """Solo descarta columnas opcionales; nunca relaja filtros ni orden solicitado."""
     payload = json.loads(payload_json)
     cookies = {"sessionid": sessionid} if sessionid else None
     descartados = []
@@ -347,7 +344,9 @@ def escanear(url, payload_json, sessionid):
             js = r.json()
         except ValueError:
             js = {}
-        err = js.get("error") if isinstance(js, dict) else None
+        if not isinstance(js, dict) or (r.ok and "data" not in js and "error" not in js):
+            return [], 0, payload["columns"], descartados, "Respuesta del proveedor no válida."
+        err = js.get("error")
         if r.ok and not err:
             return js.get("data") or [], js.get("totalCount", 0), payload["columns"], descartados, None
         texto = str(err or r.text[:300])
@@ -359,6 +358,10 @@ def escanear(url, payload_json, sessionid):
         en_sort = payload.get("sort", {}).get("sortBy") == malo
         if not malo or not (en_cols or en_flt or en_sort):
             return [], 0, payload["columns"], descartados, f"HTTP {r.status_code}: {texto}"
+        if en_flt or en_sort or malo in {"name", "description", "close", "change"}:
+            return [], 0, payload["columns"], descartados, (
+                f"El proveedor no admite {malo}. No se muestran resultados porque "
+                "no se pueden respetar los filtros, el orden o los datos esenciales.")
         payload["columns"] = [c for c in payload["columns"] if c != malo]
         payload["filter"] = [f for f in payload["filter"]
                              if f["left"] != malo and (isinstance(f.get("right"), list) or f.get("right") != malo)]
@@ -392,7 +395,7 @@ def etiqueta_retraso(v):
     if not isinstance(v, str):
         return None
     if v == "streaming":
-        return "⚡ Tiempo real"
+        return "Streaming declarado · latencia no verificada"
     m = re.search(r"delayed_streaming_(\d+)", v)
     if m:
         return f"⏱️ {int(m.group(1)) // 60} min"
@@ -623,7 +626,7 @@ def cuerpo():
 
     izq, der = st.columns([5, 2])
     izq.subheader(universo)
-    der.caption(f"Actualizado {datetime.now().strftime('%H:%M:%S')} (hora del servidor)"
+    der.caption(f"Consulta {datetime.now().strftime('%H:%M:%S')} (hora del servidor)"
                 + (f" · auto {cada}s" if auto else ""))
     if der.button("🔄 Actualizar", use_container_width=True):
         escanear.clear()
@@ -636,6 +639,10 @@ def cuerpo():
     if df.empty:
         st.warning("Ningún valor cumple los filtros. Relaja alguno o pulsa **Limpiar**.")
         return
+
+    if ss["malos"]:
+        st.warning("Columnas no disponibles: " + ", ".join(ss["malos"]))
+    st.caption("La hora de consulta no es la hora de la cotización. Actualizar más a menudo no elimina el retraso del proveedor.")
 
     # ── amplitud del mercado ────────────────────────────────────────────────
     ch = pd.to_numeric(df.get("change"), errors="coerce")
@@ -780,3 +787,4 @@ def cuerpo():
 
 cuerpo()
 st.caption("Datos del escáner de TradingView (endpoint no oficial). Uso personal e informativo; no es asesoramiento financiero.")
+
